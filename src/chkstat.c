@@ -37,6 +37,7 @@
 #include <sys/mount.h>
 #include <limits.h>
 #include <sys/param.h>
+#include <sched.h>
 
 #define BAD_LINE() \
   fprintf(stderr, "bad permissions line %s:%d\n", permfiles[i], lcnt)
@@ -454,8 +455,6 @@ check_have_proc(void)
   return override == NULL && r == 0 && proc.f_type == PROC_SUPER_MAGIC;
 }
 
-static const char proc_mount_path_pattern[] = "/tmp/chkstat.proc.XXXXXX";
-static char proc_mount_path[sizeof(proc_mount_path_pattern)];
 enum proc_mount_state {
   PROC_MOUNT_STATE_UNKNOWN,
   PROC_MOUNT_STATE_SYSTEM,
@@ -471,14 +470,36 @@ cleanup_proc(void)
     return;
 
   // intentionally no error checking during cleanup
-  umount(proc_mount_path);
-  rmdir(proc_mount_path);
+  umount2("/proc", MNT_DETACH);
+  rmdir("/proc");
+}
+
+static int
+switch_mount_namespace(void)
+{
+  // switch to mount namespace
+  int r = unshare(CLONE_NEWNS);
+  if (r != 0)
+    return r;
+
+  // make sure our changes in mounts don't affect anything else
+  r = mount("", "/", "", MS_REC | MS_SLAVE, "");
+  if (r != 0)
+    return r;
+
+  // if we pretend that there is no /proc, we actually have to umount it so that the mount of /proc won't fail
+  char *override = secure_getenv("CHKSTAT_PRETEND_NO_PROC");
+  if (override)
+    umount2("/proc", MNT_DETACH);
+
+  return 0;
+
 }
 
 #define _STRINGIFY(s) #s
 #define STRINGIFY(s) _STRINGIFY(s)
 
-#define PROC_PATH_SIZE (sizeof(proc_mount_path) + sizeof("/self/fd/") + sizeof(STRINGIFY(INT_MAX)))
+#define PROC_PATH_SIZE (sizeof("/proc/self/fd/") + sizeof(STRINGIFY(INT_MAX)))
 static int
 make_proc_path(int fd, char path[static PROC_PATH_SIZE])
 {
@@ -503,24 +524,21 @@ make_proc_path(int fd, char path[static PROC_PATH_SIZE])
           // Other tools apparently sometimes misbehave and change things outside their chroot when they have
           // working /proc so this can't be changed.
           //
-          // As a work-around, we mount our own private proc in a temporary directory. This requires
+          // As a work-around, we mount proc only in our own private mount namespace. This requires
           // CAP_SYS_ADMIN (in addition to CAP_DAC_OVERRIDE like the rest of the tool).
-          memcpy(proc_mount_path, proc_mount_path_pattern, sizeof(proc_mount_path));
-          char *res = mkdtemp(proc_mount_path);
-          if (res == NULL)
-            goto mount_fail;
-          int r = mount("proc", proc_mount_path, "proc", MS_NOEXEC|MS_NOSUID|MS_NODEV|MS_RELATIME, "");
+          int r = switch_mount_namespace();
           if (r != 0)
-            {
-              rmdir(proc_mount_path);
-              goto mount_fail;
-            }
+            goto mount_fail;
+
+          r = mount("proc", "/proc", "proc", MS_NOEXEC|MS_NOSUID|MS_NODEV|MS_RELATIME, "");
+          if (r != 0)
+            goto mount_fail;
           proc_mount_avail = PROC_MOUNT_STATE_CUSTOM;
           atexit(cleanup_proc);
         }
     }
 
-  snprintf(path, PROC_PATH_SIZE, "%s/self/fd/%d", proc_mount_avail == 1 ? "/proc" : proc_mount_path, fd);
+  snprintf(path, PROC_PATH_SIZE, "/proc/self/fd/%d", fd);
 
   return 0;
 
